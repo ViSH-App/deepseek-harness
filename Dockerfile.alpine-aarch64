@@ -1,0 +1,116 @@
+# syntax=docker/dockerfile:1
+#
+# Self-contained aarch64 Alpine (musl) runtime bundle, built from source.
+#
+# Every native module — node-pty above all — must compile against musl for the
+# target architecture, so the build runs inside the target image rather than
+# packaging artifacts produced elsewhere: a glibc-built pty.node cannot dlopen
+# on Alpine.
+#
+# Build and export the archive:
+#   docker buildx build --platform linux/arm64 --target export \
+#     --output type=local,dest=out -f Dockerfile.alpine-aarch64 .
+#
+# Run the bundled smoke test instead:
+#   docker buildx build --platform linux/arm64 --target smoke \
+#     -f Dockerfile.alpine-aarch64 .
+
+ARG NODE_IMAGE=node:24-alpine
+ARG PNPM_VERSION=11.7.0
+ARG BUNDLE_NAME=dsh-alpine-aarch64
+
+FROM ${NODE_IMAGE} AS builder
+ARG PNPM_VERSION
+ARG BUNDLE_NAME
+
+# node-gyp toolchain for node-pty, which publishes no Linux prebuild; cmake for
+# koffi, whose prebuilt binary does not load on musl/arm64 and falls back to a
+# source build; GNU tar and zstd for the archive, since busybox tar cannot
+# filter through an external compressor.
+RUN apk add --no-cache bash git python3 make g++ linux-headers libstdc++ tar zstd cmake
+
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
+
+# A fixed store path gives the cache mounts below a stable target.
+ENV PNPM_CONFIG_STORE_DIR=/pnpm-store
+
+WORKDIR /repo
+COPY . .
+
+# Build tooling lives in devDependencies, so the bundle is installed twice: a
+# full install to produce lib/ and dist/, then a prod-only install over the
+# same tree.
+RUN --mount=type=cache,target=/pnpm-store \
+    pnpm install --frozen-lockfile
+
+RUN pnpm run build
+
+# Everything above is the compiled workspace; split here so the packaging
+# strategy below can be reworked without repeating install and build.
+FROM builder AS packaged
+
+# Clear every install tree, including nested workspace ones, so the prod
+# install cannot inherit a stale dev dependency.
+#
+# public-hoist-pattern=*: every workspace package declares @deepseek-ai/cordis
+# and its sibling peers as peerDependencies (+ dev), so --prod leaves the
+# workspace source dirs (packages/*, vendor/*) without node_modules of their
+# own. Node realpath-resolves workspace symlinks before resolving their
+# imports, so those dirs must find their peers somewhere on the walk up to
+# /repo/node_modules. Public hoisting links every package — workspace links
+# included — into the root node_modules, which that walk always reaches. All
+# links stay relative, and tar preserves them through the archive.
+RUN --mount=type=cache,target=/pnpm-store \
+    find . -name node_modules -type d -prune -exec rm -rf {} + \
+ && pnpm install --prod --frozen-lockfile \
+      --config.public-hoist-pattern='*' \
+      --config.hoist-workspace-packages=true
+
+# koffi's platform sidecar tries its glibc build before the musl one and
+# relies on require() failing cleanly to fall through. On Alpine the glibc
+# koffi.node gets far enough into dlopen to abort the process from a C++
+# static initializer instead of throwing, so the fallback never runs. Delete
+# the glibc variant; the sidecar then falls through to the musl build.
+RUN set -eu; \
+    for dir in node_modules/.pnpm/@koromix+koffi-linux-arm64@*/node_modules/@koromix/koffi-linux-arm64; do \
+      [ -d "$dir/musl_arm64" ] || { echo "koffi sidecar: musl_arm64 build missing in $dir" >&2; exit 1; }; \
+      rm -rf "$dir/linux_arm64"; \
+    done
+
+# Any absolute symlink resolves here and dangles on the target host.
+RUN outside=$(find . -type l | while read -r link; do \
+      target=$(readlink "$link"); \
+      case "$target" in /*) echo "$link -> $target" ;; esac; \
+    done); \
+    if [ -n "$outside" ]; then \
+      echo "bundle: absolute symlinks would dangle after extraction:" >&2; \
+      echo "$outside" >&2; \
+      exit 1; \
+    fi; \
+    echo "bundle: $(find . -type f | wc -l) files, $(find . -type l | wc -l) relative symlinks"
+
+# zstd level 12 with all cores: well past gzip on both ratio and speed for a
+# tree this size. Raise toward 19 for a smaller artifact at a steep
+# compression-time cost.
+RUN tar -I "zstd -T0 -12" -cf "/${BUNDLE_NAME}.tar.zst" . \
+ && ls -lh "/${BUNDLE_NAME}.tar.zst"
+
+# Prove the archive runs on a clean Alpine with no build toolchain: only bash
+# (a runtime requirement of the bash tool, absent from the base image) and the
+# tools needed to unpack.
+FROM ${NODE_IMAGE} AS smoke
+ARG BUNDLE_NAME
+RUN apk add --no-cache bash tar zstd
+COPY --from=packaged /${BUNDLE_NAME}.tar.zst /tmp/bundle.tar.zst
+RUN mkdir -p /opt/dsh \
+ && tar -I zstd -xf /tmp/bundle.tar.zst -C /opt/dsh \
+ && rm /tmp/bundle.tar.zst \
+ && cd /opt/dsh \
+ && node --expose-internals apps/cli/lib/bin.js --profile web --help \
+ && touch /smoke-passed
+
+# Export target: the archive only, gated on the smoke test having passed.
+FROM scratch AS export
+ARG BUNDLE_NAME
+COPY --from=smoke /smoke-passed /smoke-passed
+COPY --from=packaged /${BUNDLE_NAME}.tar.zst /

@@ -1,0 +1,94 @@
+# Build the aarch64 Alpine (musl) runtime bundle and publish it as a release.
+#
+# All build logic lives in Dockerfile.alpine-aarch64 so the same command
+# reproduces this job locally. This workflow only supplies a native arm64
+# runner, uploads the archive, and cuts the release.
+name: Alpine aarch64 Bundle
+
+on:
+  push:
+    branches: [feat/alpine-aarch64-bundle]
+
+# Creating the release needs write access to repository contents.
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUNDLE_NAME: dsh-alpine-aarch64
+
+jobs:
+  bundle:
+    name: Build aarch64 Alpine bundle
+    # Native arm64. QEMU emulation on an x64 runner was tried and is not
+    # viable: the emulator aborts partway through pnpm install with
+    # "uncaught target signal 4 (Illegal instruction)" on instructions the
+    # Node 24 JIT emits. Emulation is also an order of magnitude slower.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The export target depends on the smoke stage, so a bundle that cannot
+      # boot on clean Alpine fails here rather than reaching the release.
+      - name: Build, verify, and export the bundle
+        run: |
+          docker buildx build \
+            --target export \
+            --output type=local,dest=out \
+            --build-arg "BUNDLE_NAME=${BUNDLE_NAME}" \
+            --progress plain \
+            -f Dockerfile.alpine-aarch64 \
+            .
+          mv "out/${BUNDLE_NAME}.tar.zst" .
+          ls -lh "${BUNDLE_NAME}.tar.zst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE_NAME }}
+          path: ${{ env.BUNDLE_NAME }}.tar.zst
+          # The payload is already zstd-compressed; zipping it again only
+          # costs time.
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Resolve release identity
+        id: meta
+        run: |
+          version=$(node -p "require('./package.json').version")
+          {
+            echo "version=$version"
+            echo "date=$(date -u +%Y-%m-%d)"
+            echo "tag=v${version}-$(date -u +%Y%m%d)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Rebuilding the same version on the same day replaces that day's
+      # release rather than failing on the existing tag.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "${BUNDLE_NAME}.tar.zst" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION ($DATE)" \
+            --notes "aarch64 Alpine (musl) runtime bundle, built from \`$GITHUB_SHA\`.
+
+          Requires Node >= 22.19 on the target host. No build toolchain needed.
+
+          \`\`\`sh
+          apk add --no-cache bash tar zstd
+          mkdir -p /opt/dsh && tar -I zstd -xf ${BUNDLE_NAME}.tar.zst -C /opt/dsh
+          node --expose-internals /opt/dsh/apps/cli/lib/bin.js --profile web
+          \`\`\`"

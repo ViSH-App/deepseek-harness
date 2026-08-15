@@ -1,0 +1,11 @@
+# Build context for Dockerfile.alpine-aarch64. Everything not excluded here
+# ends up in the bundle, so exclusions are limited to what the target host
+# cannot use or would rebuild anyway.
+.git
+.github
+node_modules
+**/node_modules
+*.tar.zst
+*.tar.gz
+# Local export destination of Dockerfile.alpine-aarch64 builds.
+out
